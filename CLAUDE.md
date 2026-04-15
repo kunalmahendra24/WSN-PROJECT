@@ -11,17 +11,26 @@ Simulates sensor node placement, network coverage, energy consumption, and batte
   - Frontend: http://localhost:5173
   - Backend: http://localhost:5001
 
+## Architecture Diagram
+
+- **File:** `WSN_project_F2.excalidraw` (root of repo)
+- **Live link:** https://excalidraw.com/#json=ec4u2RbomCSYBDHVpfPSb,7d0OHGC1cLK9N19O3ERJbw
+- Covers: Frontend flow, Backend API routes, MongoDB collections, Energy Model, all 4 algorithms
+
 ---
 
 ## Key Files
 
 | File | Purpose |
 |------|---------|
-| `backend/services/simulationService.js` | Core simulation engine — all algorithms |
+| `backend/services/simulationService.js` | Core simulation engine — algorithms for API route (`/api/simulate`) |
 | `frontend/src/App.jsx` | Main React component — state, canvas render, simulation logic, UI |
 | `frontend/src/utils/algorithms.js` | Reusable algorithm library (Delaunay, Voronoi, constants) |
 | `backend/routes/simulation.js` | API routes for simulation |
 | `backend/routes/auth.js` | JWT auth routes |
+| `frontend/vite.config.js` | Vite config — proxies `/api` → `http://localhost:5001` |
+| `backend/image/` | Reference screenshots (1.png–7.png) |
+| `WSN_project_F2.excalidraw` | Architecture & algorithm flow diagram |
 
 > `indoorRenderer.js` and `outdoorRenderer.js` are no longer used. All rendering is done directly in `App.jsx` via a single `draw()` function on `canvasRef`.
 
@@ -45,8 +54,17 @@ Simulates sensor node placement, network coverage, energy consumption, and batte
 ### Node Placement
 - **Hybrid only** — Random/Grid/Manual have been removed. Only Hybrid placement exists.
 - `const [placement] = useState("Hybrid")` — no setter, fixed value.
-- Hybrid uses Discrete Lloyd's relaxation (20 iterations), stores full `iterHistory`.
-- Default display: best iteration (highest coverage). Slider lets user scrub through all iterations.
+
+**Two Hybrid implementations (diverged — see Known Issues):**
+
+| Location | Algorithm | Iterations |
+|---|---|---|
+| `App.jsx` (frontend) | Discrete Lloyd's Relaxation — grid centroid, 60% lerp | 20 iters, stores `iterHistory` |
+| `simulationService.js` (backend API) | Repulsion-based forces — push nodes apart by `minD` | 80 iters, no history |
+
+- Frontend default display: best iteration (highest coverage). Slider lets user scrub through all iterations.
+- Backend `minD = sqrt(W×H / N) × 0.65` — target minimum spacing between nodes.
+- Nodes clamped to `[5%, 95%]` of area in both implementations.
 
 ### Visualization Overlay Options (`ov` state)
 - `voronoi` — Voronoi cells only
@@ -222,8 +240,13 @@ User configures → Run Simulation
 - No seeded RNG — same config produces different layouts each run
 - Fix: Implement Mulberry32 seeded RNG
 
+### Medium — Hybrid Algorithm Divergence
+- `simulationService.js` uses repulsion-based Hybrid (80 iters); `App.jsx` uses Discrete Lloyd's (20 iters)
+- Results from the API endpoint differ from the frontend-rendered simulation
+- Fix: Unify to one algorithm in `utils/algorithms.js`, import in both
+
 ### Low — Code Duplication
-- Algorithms duplicated in `simulationService.js` and `App.jsx` (both embed Delaunay/Voronoi)
+- Delaunay/Voronoi logic duplicated in `simulationService.js` and `App.jsx`
 - Fix: Consolidate to `utils/algorithms.js` only
 
 ### Low — Coverage Approximation in Charts
