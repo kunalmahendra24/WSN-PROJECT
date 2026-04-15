@@ -360,6 +360,61 @@ After simulation, the system generates automated recommendations based on the re
 
 ---
 
+## Algorithm Limitations
+
+### 1. Discrete Lloyd's Relaxation (Node Placement)
+
+| Limitation | Detail |
+|---|---|
+| Non-deterministic | No seeded RNG — same config gives a different layout every run |
+| Local optimum only | 20 iterations may not reach the global optimum; result depends on random initial placement |
+| Fixed iteration count | Always runs all 20 iterations even if convergence happens earlier |
+| 60% lerp is heuristic | The lerp factor is hand-tuned — no theoretical guarantee of fastest convergence |
+| No obstacle awareness | Treats area as a fully open rectangle; walls or obstacles are not considered during placement |
+| Boundary bias | Nodes clamped to 5–95% of area — corners and edges may be under-covered |
+
+### 2. Delaunay Triangulation (Bowyer-Watson)
+
+| Limitation | Detail |
+|---|---|
+| Full recomputation on drag | No incremental update — entire triangulation recomputed from scratch on every node move |
+| Degenerate cases | Collinear or nearly collinear nodes can produce very thin triangles with poor link quality |
+| No signal strength weighting | All edges treated equally; actual RF quality not factored into topology |
+
+### 3. Voronoi Diagram
+
+| Limitation | Detail |
+|---|---|
+| Boundary clipping inaccuracy | Cells near area boundary are clipped — their area is underestimated |
+| Coverage ≠ Voronoi cell | A node's sensing circle (radius `sR`) and its Voronoi cell are independent — the cell can be larger than actual sensing range |
+
+### 4. Coverage Calculation (Grid Sampling)
+
+| Limitation | Detail |
+|---|---|
+| Approximation error | Grid step = `min(W,H)/60` — coarse for large areas, introduces ±1–2% error |
+| Dead nodes not removed | Chart coverage uses `(alive/total) × covPct` — Voronoi cells of dead nodes are still counted |
+| 2D flat plane only | No elevation, floors, or 3D signal propagation modelled |
+
+### 5. Energy & Battery Model
+
+| Limitation | Detail |
+|---|---|
+| First-order radio model only | `E_amp × d²` assumes free-space propagation — does not capture indoor multipath fading |
+| Simplified battery drain | ±20% random variance per node per day — real degradation is non-linear and temperature-dependent |
+| No duty cycling | All nodes assumed always-on; sleep/wake scheduling (e.g. S-MAC, TDMA) is not modelled |
+| Homogeneous network | All nodes use the same energy constants — heterogeneous hardware not supported |
+
+### 6. BFS Connectivity Check
+
+| Limitation | Detail |
+|---|---|
+| Binary result only | Returns only connected / disconnected — no partial score or fault-tolerance (k-connectivity) |
+| No interference modelling | Two in-range nodes assumed to communicate perfectly — co-channel interference ignored |
+| Static snapshot | BFS runs on the current placement; node mobility or dynamic link failure not modelled |
+
+---
+
 ## Key Academic References
 
 1. **Bowyer-Watson Algorithm** — Bowyer (1981), Watson (1981) — Delaunay triangulation
