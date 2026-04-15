@@ -266,6 +266,30 @@ function generateNodes(numNodes, width, height, placement) {
         alive: true,
       });
     }
+  } else if (placement === 'Hybrid') {
+    // Repulsion-based spacing: push nodes apart until minimum distance is maintained
+    for (let i = 0; i < numNodes; i++) {
+      nodes.push({
+        id: i,
+        x: Math.random() * width * 0.85 + width * 0.075,
+        y: Math.random() * height * 0.85 + height * 0.075,
+        alive: true,
+      });
+    }
+    const minD = Math.sqrt((width * height) / numNodes) * 0.65;
+    for (let iter = 0; iter < 80; iter++) {
+      for (let i = 0; i < nodes.length; i++) {
+        let fx = 0, fy = 0;
+        for (let j = 0; j < nodes.length; j++) {
+          if (i === j) continue;
+          const dx = nodes[i].x - nodes[j].x, dy = nodes[i].y - nodes[j].y;
+          const d = Math.hypot(dx, dy);
+          if (d < minD && d > 0.01) { const f = (minD - d) / minD; fx += (dx / d) * f; fy += (dy / d) * f; }
+        }
+        nodes[i].x = Math.max(width * 0.05, Math.min(width * 0.95, nodes[i].x + fx * 1.5));
+        nodes[i].y = Math.max(height * 0.05, Math.min(height * 0.95, nodes[i].y + fy * 1.5));
+      }
+    }
   } else {
     // Random placement with margin
     for (let i = 0; i < numNodes; i++) {
@@ -336,10 +360,17 @@ export function runSimulation(config) {
   }
   const avgDist = distCount > 0 ? totalDist / distCount : 0;
 
-  // Step 5: Coverage calculation
+  // Step 5: Coverage calculation (grid sampling — avoids double-counting overlapping circles)
   const totalArea = areaWidth * areaHeight;
-  const coveredArea = nodes.length * Math.PI * sRange * sRange;
-  const coveragePct = Math.min(100, (coveredArea / totalArea) * 100);
+  const gridStep = Math.max(1, Math.min(areaWidth, areaHeight) / 60);
+  let coveredCells = 0, totalCells = 0;
+  for (let gx = 0; gx < areaWidth; gx += gridStep) {
+    for (let gy = 0; gy < areaHeight; gy += gridStep) {
+      totalCells++;
+      if (nodes.some(n => Math.hypot(n.x - gx, n.y - gy) <= sRange)) coveredCells++;
+    }
+  }
+  const coveragePct = Math.round((coveredCells / totalCells) * 1000) / 10;
 
   // Step 6: Path loss
   const pathLoss = envType === 'Indoor'

@@ -90,22 +90,6 @@ function polyArea(vs) {
   return Math.abs(a) / 2;
 }
 
-// ═══════════════════════════════════════════════════════════════
-// TILE MAP UTILS (OpenStreetMap)
-// ═══════════════════════════════════════════════════════════════
-function latLngToTile(lat, lng, zoom) {
-  const n = Math.pow(2, zoom);
-  const x = ((lng + 180) / 360) * n;
-  const latRad = (lat * Math.PI) / 180;
-  const y = ((1 - Math.log(Math.tan(latRad) + 1 / Math.cos(latRad)) / Math.PI) / 2) * n;
-  return { x, y };
-}
-function tileToLatLng(tx, ty, zoom) {
-  const n = Math.pow(2, zoom);
-  const lng = (tx / n) * 360 - 180;
-  const latRad = Math.atan(Math.sinh(Math.PI * (1 - (2 * ty) / n)));
-  return { lat: (latRad * 180) / Math.PI, lng };
-}
 
 // ═══════════════════════════════════════════════════════════════
 // MAIN APP
@@ -122,14 +106,12 @@ export default function App() {
   const [aW, setAW] = useState(120);
   const [aH, setAH] = useState(90);
   const [sensor, setSensor] = useState("Temperature");
-  const [placement, setPlacement] = useState("Random");
+  const [placement] = useState("Hybrid");
   const [battType, setBattType] = useState("Li-ion");
   const [capacity, setCapacity] = useState(3000);
   const [txInt, setTxInt] = useState(30);
   const [ple, setPle] = useState(4.0);
   const [wallAtt, setWallAtt] = useState(5);
-  const [cLat, setCLat] = useState(23.0225);
-  const [cLng, setCLng] = useState(72.5714);
 
   const [nodes, setNodes] = useState([]);
   const [edgesArr, setEdgesArr] = useState([]);
@@ -139,14 +121,15 @@ export default function App() {
   const [done, setDone] = useState(false);
   const [ov, setOv] = useState("hybrid");
   const [tab, setTab] = useState("viz");
+  const [iterHistory, setIterHistory] = useState([]);
+  const [iterIdx, setIterIdx] = useState(0);
+  const [iterPlaying, setIterPlaying] = useState(false);
+  const [loading, setLoading] = useState(false);
+  const iterPlayRef = useRef(null);
 
-  const indoorRef = useRef(null);
-  const outdoorRef = useRef(null);
+  const canvasRef = useRef(null);
   const dragRef = useRef(-1);
-  const tileCache = useRef({});
-  const mZoom = useRef(16);
-  const mDragS = useRef(null);
-  const mOff = useRef({ x: 0, y: 0 });
+  const bestIterRef = useRef(0); // stores bestIdx synchronously before state update
   const chartRefs = [useRef(null), useRef(null), useRef(null), useRef(null)];
 
   const doAuth = () => {
@@ -164,14 +147,24 @@ export default function App() {
     }
   };
 
-  const recompute = useCallback((pts) => {
+  const recompute = useCallback((pts, commRange = Infinity) => {
     if (pts.length < 3) return { edges: [], cells: [], minDist: 0 };
-    const { tris, edges: ed } = delaunay(pts);
+    const { tris, edges: allEd } = delaunay(pts);
     const cl = voronoiFn(pts, tris);
+
+    // Tag each edge: inRange = within communication range, outRange = too far
+    const ed = allEd.map(([a, b]) => {
+      const d = Math.hypot(pts[a].x - pts[b].x, pts[a].y - pts[b].y);
+      return { a, b, dist: d, inRange: d <= commRange };
+    });
+
     let gMin = Infinity;
     pts.forEach((p, i) => {
       const nb = [];
-      for (const [a, b] of ed) { if (a === i) nb.push(b); else if (b === i) nb.push(a); }
+      for (const e of ed) {
+        if (e.a === i) nb.push(e.b);
+        else if (e.b === i) nb.push(e.a);
+      }
       let md = Infinity;
       for (const n of nb) { const d = Math.hypot(pts[n].x - p.x, pts[n].y - p.y); if (d < md) md = d; if (d < gMin) gMin = d; }
       p.minN = md === Infinity ? 0 : md;
@@ -181,25 +174,33 @@ export default function App() {
     return { edges: ed, cells: cl, minDist: gMin === Infinity ? 0 : gMin };
   }, []);
 
-  const runSim = useCallback(() => {
-    const sR = SENSORS[sensor].range, sP = SENSORS[sensor].power, bV = BATTS[battType].v;
-    let pts;
-    if (placement === "Grid") {
-      const cols = Math.ceil(Math.sqrt(numNodes * aW / aH));
-      const rows = Math.ceil(numNodes / cols);
-      pts = Array.from({ length: numNodes }, (_, i) => ({ id: i, x: ((i % cols) + 1) * aW / (cols + 1), y: (Math.floor(i / cols) + 1) * aH / (rows + 1), alive: true, batt: 1 }));
-    } else {
-      pts = Array.from({ length: numNodes }, (_, i) => ({ id: i, x: Math.random() * aW * 0.85 + aW * 0.075, y: Math.random() * aH * 0.85 + aH * 0.075, alive: true, batt: 1 }));
-    }
-    const { edges: ed, cells: cl, minDist } = recompute(pts);
-    let td = 0, dc = 0;
-    for (const [a, b] of ed) { td += Math.hypot(pts[a].x - pts[b].x, pts[a].y - pts[b].y); dc++; }
-    const avgD = dc > 0 ? td / dc : 0;
-    const covPct = Math.min(100, (pts.length * Math.PI * sR * sR) / (aW * aH) * 100);
-    const pl = env === "Indoor" ? plIndoor(avgD, ple, wallAtt) : plFSPL(avgD);
+  // Shared helpers used inside runSim
+  const calcCov = useCallback((ps, sR) => {
+    const gs = Math.max(1, Math.min(aW, aH) / 60);
+    let cc = 0, tc = 0;
+    for (let gx = 0; gx < aW; gx += gs) for (let gy = 0; gy < aH; gy += gs) { tc++; if (ps.some(p => Math.hypot(p.x - gx, p.y - gy) <= sR)) cc++; }
+    return Math.round((cc / tc) * 1000) / 10;
+  }, [aW, aH]);
+
+  const calcConn = useCallback((ps, ed) => {
+    if (ps.length === 0) return false;
+    // Only use in-range edges for connectivity check
+    const inRangeEd = ed.filter ? ed.filter(e => e.inRange) : ed;
     const vis = new Set([0]), q = [0];
-    while (q.length) { const c = q.shift(); for (const [a, b] of ed) { const n = a === c ? b : b === c ? a : -1; if (n >= 0 && !vis.has(n)) { vis.add(n); q.push(n); } } }
-    const conn = vis.size === pts.length;
+    while (q.length) { const c = q.shift(); for (const e of inRangeEd) { const a = e.a ?? e[0], b = e.b ?? e[1]; const n = a === c ? b : b === c ? a : -1; if (n >= 0 && !vis.has(n)) { vis.add(n); q.push(n); } } }
+    return vis.size === ps.length;
+  }, []);
+
+  const finalize = useCallback((pts, sR, sP, bV) => {
+    const commRange = sR * 2;
+    const { edges: ed, cells: cl, minDist } = recompute(pts, commRange);
+    let td = 0, dc = 0;
+    // ed is now [{a, b, dist, inRange}] — use e.a / e.b not [a,b] destructuring
+    for (const e of ed) { td += Math.hypot(pts[e.a].x - pts[e.b].x, pts[e.a].y - pts[e.b].y); dc++; }
+    const avgD = dc > 0 ? td / dc : 0;
+    const covPct = calcCov(pts, sR);
+    const pl = env === "Indoor" ? plIndoor(avgD, ple, wallAtt) : plFSPL(avgD);
+    const conn = calcConn(pts, ed);
     const rpd = (24 * 3600) / txInt, epr = ePR(avgD), bJ = mAhToJ(capacity, bV);
     const ns = pts.map(() => ({ b: bJ, a: true }));
     const tsd = [];
@@ -212,15 +213,146 @@ export default function App() {
       for (const n of ns) { if (!n.a) continue; n.b -= de * (0.8 + Math.random() * 0.4); if (n.b <= 0) { n.b = 0; n.a = false; } }
     }
     const fd = tsd.find(t => t.alive < pts.length)?.day || tsd[tsd.length - 1]?.day || 0;
-    setNodes(pts); setEdgesArr(ed); setCellsArr(cl); setTs(tsd);
-    setMet({ n: pts.length, minDist, avgD, covPct, pl, conn, W: aW, H: aH, sR, battLife: tsd[tsd.length - 1]?.day || 0, firstDeath: fd, totalArea: aW * aH });
-    setDone(true); setTab("viz");
-  }, [numNodes, aW, aH, sensor, placement, battType, capacity, txInt, ple, wallAtt, env, recompute]);
+    return { ed, cl, minDist, avgD, covPct, pl, conn, tsd, fd };
+  }, [aW, aH, env, ple, wallAtt, txInt, capacity, calcCov, calcConn, recompute]);
 
-  // ─── INDOOR CANVAS ───
-  const drawIndoor = useCallback(() => {
-    const c = indoorRef.current;
-    if (!c || !met || env !== "Indoor") return;
+  const runSim = useCallback(() => {
+    setLoading(true);
+    // setTimeout 0 lets React render the loading state before heavy computation starts
+    setTimeout(() => {
+    const sR = SENSORS[sensor].range, sP = SENSORS[sensor].power, bV = BATTS[battType].v;
+    let pts;
+
+    {
+      // ── HYBRID ITERATIVE OPTIMIZATION ──
+      // Step 1: Random initial placement
+      pts = Array.from({ length: numNodes }, (_, i) => ({
+        id: i, x: Math.random() * aW * 0.85 + aW * 0.075,
+        y: Math.random() * aH * 0.85 + aH * 0.075, alive: true, batt: 1
+      }));
+
+      const history = [];
+      const commRange = sR * 2;
+      // Grid resolution — finer = more accurate territory assignment
+      const gs = Math.max(1.5, Math.min(aW, aH) / 30);
+
+      for (let iter = 0; iter <= 20; iter++) {
+        // Step 2: Evaluate current placement
+        const { edges: ed, cells: cl, minDist: mD } = recompute(pts, commRange);
+        const cov = calcCov(pts, sR);
+        const conn = calcConn(pts, ed);
+        history.push({ iter, pts: pts.map(p => ({ ...p })), edges: ed, cells: cl, coverage: cov, connected: conn, minDist: mD });
+
+        if (cov >= 90 && conn) break;
+
+        // Step 4: Discrete Lloyd's relaxation
+        // Each node "owns" the grid cells nearest to it — move to centroid of owned cells
+        // This guarantees no overlap (territories never overlap by definition)
+        const sumX = new Float64Array(pts.length);
+        const sumY = new Float64Array(pts.length);
+        const cnt  = new Int32Array(pts.length);
+
+        for (let gx = gs / 2; gx < aW; gx += gs) {
+          for (let gy = gs / 2; gy < aH; gy += gs) {
+            // Find which node is nearest to this grid cell
+            let nearest = 0, nearDist = Infinity;
+            for (let j = 0; j < pts.length; j++) {
+              const d = Math.hypot(pts[j].x - gx, pts[j].y - gy);
+              if (d < nearDist) { nearDist = d; nearest = j; }
+            }
+            sumX[nearest] += gx;
+            sumY[nearest] += gy;
+            cnt[nearest]++;
+          }
+        }
+
+        // Move each node to centroid of its territory (bounded within area)
+        pts = pts.map((p, i) => {
+          if (cnt[i] === 0) return p;
+          const cx = sumX[i] / cnt[i];
+          const cy = sumY[i] / cnt[i];
+          // Lerp toward centroid (0.6 = smooth movement, not teleport)
+          return {
+            ...p,
+            x: Math.max(aW * 0.03, Math.min(aW * 0.97, p.x + (cx - p.x) * 0.6)),
+            y: Math.max(aH * 0.03, Math.min(aH * 0.97, p.y + (cy - p.y) * 0.6)),
+          };
+        });
+      }
+
+      // Pick best iteration: connected preferred, then highest coverage
+      const bestIdx = history.reduce((bi, it, i) => {
+        const prev = history[bi];
+        if (it.connected && !prev.connected) return i;
+        if (!it.connected && prev.connected) return bi;
+        return it.coverage > prev.coverage ? i : bi;
+      }, 0);
+
+      // Store bestIdx in ref BEFORE state updates (synchronous, no stale closure issue)
+      bestIterRef.current = bestIdx;
+
+      const bIt = history[bestIdx];
+      pts = bIt.pts;
+      const { avgD, tsd, fd } = finalize(pts, sR, sP, bV);
+
+      // setIterHistory triggers a useEffect that applies best iteration to canvas
+      setIterHistory(history);
+      setIterIdx(bestIdx);
+      setTs(tsd);
+      setMet({ n: pts.length, minDist: bIt.minDist, avgD, covPct: bIt.coverage, pl: env === "Indoor" ? plIndoor(avgD, ple, wallAtt) : plFSPL(avgD), conn: bIt.connected, W: aW, H: aH, sR, battLife: tsd[tsd.length - 1]?.day || 0, firstDeath: fd, totalArea: aW * aH });
+      setDone(true); setTab("viz"); setLoading(false);
+    }
+    }, 0); // end setTimeout
+  }, [numNodes, aW, aH, sensor, placement, battType, capacity, txInt, ple, wallAtt, env, recompute, calcCov, calcConn, finalize]);
+
+  // Jump to any iteration from the slider
+  const goToIter = useCallback((idx) => {
+    if (!iterHistory[idx]) return;
+    const it = iterHistory[idx];
+    setIterIdx(idx);
+    setNodes(it.pts);
+    setEdgesArr(it.edges);
+    setCellsArr(it.cells);
+    setMet(prev => prev ? { ...prev, covPct: it.coverage, conn: it.connected, minDist: it.minDist } : prev);
+  }, [iterHistory]);
+
+  // Play through all iterations like an animation
+  const playIters = useCallback(() => {
+    if (iterHistory.length === 0) return;
+    setIterPlaying(true);
+    let i = 0;
+    goToIter(0);
+    iterPlayRef.current = setInterval(() => {
+      i++;
+      if (i >= iterHistory.length) {
+        clearInterval(iterPlayRef.current);
+        setIterPlaying(false);
+        return;
+      }
+      goToIter(i);
+    }, 600);
+  }, [iterHistory, goToIter]);
+
+  const stopPlay = useCallback(() => {
+    clearInterval(iterPlayRef.current);
+    setIterPlaying(false);
+  }, []);
+
+  // When a new Hybrid simulation finishes, apply best iteration to canvas
+  // (useEffect ensures iterHistory state is fully updated before applying)
+  useEffect(() => {
+    if (iterHistory.length === 0) return;
+    const it = iterHistory[bestIterRef.current];
+    if (!it) return;
+    setNodes([...it.pts]);
+    setEdgesArr([...it.edges]);
+    setCellsArr([...it.cells]);
+  }, [iterHistory]); // only fires when new simulation runs, not on slider moves
+
+  // ─── CANVAS (Indoor + Outdoor — same rendering, only propagation differs) ───
+  const draw = useCallback(() => {
+    const c = canvasRef.current;
+    if (!c || !met) return;
     const ctx = c.getContext("2d");
     const dpr = window.devicePixelRatio || 1;
     const cw = c.parentElement?.clientWidth || 700;
@@ -239,6 +371,19 @@ export default function App() {
     ctx.fillStyle = "rgba(90,122,154,0.35)"; ctx.font = "9px monospace";
     for (let x = 0; x <= met.W; x += gs * 2) ctx.fillText(x + "m", x * sx + 2, ch - 4);
 
+    // Env label top-right
+    ctx.fillStyle = env === "Outdoor" ? "rgba(34,211,238,0.6)" : "rgba(59,158,255,0.6)";
+    ctx.font = "bold 10px monospace"; ctx.textAlign = "right";
+    ctx.fillText((env === "Outdoor" ? "🌍 Outdoor" : "🏢 Indoor") + " · Free-space PL" , cw - 8, 14);
+    ctx.textAlign = "start";
+
+    // Area boundary
+    ctx.strokeStyle = "rgba(59,158,255,0.55)"; ctx.lineWidth = 2; ctx.setLineDash([8, 4]);
+    ctx.strokeRect(1, 1, cw - 2, ch - 2);
+    ctx.setLineDash([]);
+    ctx.fillStyle = "rgba(59,158,255,0.35)"; ctx.font = "bold 10px monospace";
+    ctx.fillText(met.W + "m × " + met.H + "m", 6, 14);
+
     if (ov === "coverage" || ov === "hybrid") {
       for (const n of nodes) { if (!n.alive) continue; const g = ctx.createRadialGradient(n.x*sx,n.y*sy,0,n.x*sx,n.y*sy,met.sR*sx); g.addColorStop(0,"rgba(16,185,129,0.13)"); g.addColorStop(1,"rgba(16,185,129,0)"); ctx.fillStyle=g; ctx.beginPath(); ctx.arc(n.x*sx,n.y*sy,met.sR*sx,0,Math.PI*2); ctx.fill(); ctx.strokeStyle="rgba(16,185,129,0.18)"; ctx.lineWidth=1; ctx.setLineDash([4,4]); ctx.stroke(); ctx.setLineDash([]); }
     }
@@ -255,19 +400,25 @@ export default function App() {
       });
     }
     if (ov === "delaunay" || ov === "hybrid") {
-      for (const [a,b] of edgesArr) {
+      for (const e of edgesArr) {
+        const a = e.a ?? e[0], b = e.b ?? e[1], inR = e.inRange !== false;
         const na=nodes[a],nb=nodes[b];
         ctx.beginPath(); ctx.moveTo(na.x*sx,na.y*sy); ctx.lineTo(nb.x*sx,nb.y*sy);
-        ctx.strokeStyle=na.alive&&nb.alive?"rgba(167,139,250,0.4)":"rgba(239,68,68,0.25)"; ctx.lineWidth=1.2; ctx.stroke();
+        // Green = in range (can communicate), Red = out of range (too far)
+        ctx.strokeStyle = inR ? (na.alive&&nb.alive?"rgba(167,139,250,0.55)":"rgba(239,68,68,0.25)") : "rgba(239,68,68,0.35)";
+        ctx.lineWidth = inR ? 1.4 : 1;
+        if (!inR) ctx.setLineDash([4, 4]);
+        ctx.stroke(); ctx.setLineDash([]);
         const d=Math.hypot(na.x-nb.x,na.y-nb.y);
-        ctx.fillStyle="rgba(167,139,250,0.4)"; ctx.font="8px monospace"; ctx.textAlign="center";
-        ctx.fillText(d.toFixed(1)+"m",(na.x+nb.x)/2*sx,(na.y+nb.y)/2*sy-5); ctx.textAlign="start";
+        ctx.fillStyle = inR ? "rgba(167,139,250,0.5)" : "rgba(239,68,68,0.6)";
+        ctx.font="8px monospace"; ctx.textAlign="center";
+        ctx.fillText(d.toFixed(1)+"m"+(inR?"":" ✗"),(na.x+nb.x)/2*sx,(na.y+nb.y)/2*sy-5); ctx.textAlign="start";
       }
     }
     // Min dist
     if (met.minDist > 0) {
       let bA=-1,bB=-1,bD=Infinity;
-      for (const [a,b] of edgesArr) { const d=Math.hypot(nodes[a].x-nodes[b].x,nodes[a].y-nodes[b].y); if(d<bD){bD=d;bA=a;bB=b;} }
+      for (const e of edgesArr) { const a=e.a??e[0],b=e.b??e[1]; const d=Math.hypot(nodes[a].x-nodes[b].x,nodes[a].y-nodes[b].y); if(d<bD){bD=d;bA=a;bB=b;} }
       if (bA >= 0) {
         ctx.beginPath(); ctx.moveTo(nodes[bA].x*sx,nodes[bA].y*sy); ctx.lineTo(nodes[bB].x*sx,nodes[bB].y*sy);
         ctx.strokeStyle="#f59e0b"; ctx.lineWidth=2.5; ctx.setLineDash([6,3]); ctx.stroke(); ctx.setLineDash([]);
@@ -284,90 +435,10 @@ export default function App() {
     }
   }, [nodes, edgesArr, cellsArr, met, ov, env]);
 
-  // ─── OUTDOOR CANVAS (Tile Map) ───
-  const drawOutdoor = useCallback(() => {
-    const c = outdoorRef.current;
-    if (!c || !met || env !== "Outdoor") return;
-    const ctx = c.getContext("2d");
-    const dpr = window.devicePixelRatio || 1;
-    const cw = c.parentElement?.clientWidth || 700;
-    const ch = 500;
-    c.style.width = cw+"px"; c.style.height = ch+"px";
-    c.width = cw*dpr; c.height = ch*dpr;
-    ctx.setTransform(dpr,0,0,dpr,0,0);
-    const z = mZoom.current;
-    const ct = latLngToTile(cLat, cLng, z);
-    const ox = ct.x - (cw/256)/2 + mOff.current.x/256;
-    const oy = ct.y - (ch/256)/2 + mOff.current.y/256;
-
-    ctx.fillStyle="#0a0f1a"; ctx.fillRect(0,0,cw,ch);
-    const stx=Math.floor(ox), sty=Math.floor(oy), etx=Math.ceil(ox+cw/256), ety=Math.ceil(oy+ch/256);
-    const n2z = Math.pow(2,z);
-    for (let tx=stx;tx<=etx;tx++) for (let ty=sty;ty<=ety;ty++) {
-      const px=(tx-ox)*256, py=(ty-oy)*256;
-      const wtx = ((tx % n2z) + n2z) % n2z;
-      const key=z+"/"+wtx+"/"+ty;
-      if (tileCache.current[key]) { ctx.drawImage(tileCache.current[key],px,py,256,256); }
-      else {
-        ctx.fillStyle="#0d1520"; ctx.fillRect(px,py,256,256);
-        ctx.strokeStyle="rgba(59,158,255,0.06)"; ctx.strokeRect(px,py,256,256);
-        const img = new Image(); img.crossOrigin="anonymous";
-        img.src = "https://tile.openstreetmap.org/"+z+"/"+wtx+"/"+ty+".png";
-        const k2=key;
-        img.onload = () => { tileCache.current[k2]=img; drawOutdoor(); };
-      }
-    }
-    ctx.fillStyle="rgba(5,8,15,0.4)"; ctx.fillRect(0,0,cw,ch);
-
-    const toP = (nd) => {
-      const nLat = cLat + (nd.y - met.H/2)/111320;
-      const nLng = cLng + (nd.x - met.W/2)/(111320*Math.cos(cLat*Math.PI/180));
-      const t = latLngToTile(nLat,nLng,z);
-      return { px:(t.x-ox)*256, py:(t.y-oy)*256 };
-    };
-
-    // Area boundary
-    const corners=[{x:0,y:0},{x:met.W,y:0},{x:met.W,y:met.H},{x:0,y:met.H}].map(toP);
-    ctx.beginPath(); ctx.moveTo(corners[0].px,corners[0].py); corners.forEach(c2=>ctx.lineTo(c2.px,c2.py)); ctx.closePath();
-    ctx.strokeStyle="rgba(59,158,255,0.5)"; ctx.lineWidth=2; ctx.setLineDash([8,4]); ctx.stroke(); ctx.setLineDash([]);
-
-    if (ov==="coverage"||ov==="hybrid") {
-      for (const nd of nodes) { if(!nd.alive) continue; const p=toP(nd); const rn=toP({x:nd.x+met.sR,y:nd.y}); const rPx=Math.abs(rn.px-p.px);
-        const g=ctx.createRadialGradient(p.px,p.py,0,p.px,p.py,rPx); g.addColorStop(0,"rgba(16,185,129,0.15)"); g.addColorStop(1,"rgba(16,185,129,0)");
-        ctx.fillStyle=g; ctx.beginPath(); ctx.arc(p.px,p.py,rPx,0,Math.PI*2); ctx.fill();
-        ctx.strokeStyle="rgba(16,185,129,0.2)"; ctx.lineWidth=1; ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
-      }
-    }
-    if (ov==="voronoi"||ov==="hybrid") {
-      const cols2=["rgba(59,158,255,0.1)","rgba(167,139,250,0.1)","rgba(34,211,238,0.1)","rgba(245,158,11,0.08)"];
-      cellsArr.forEach((cell,i)=>{ if(cell.length<3) return; const pv=cell.map(toP);
-        ctx.beginPath(); ctx.moveTo(pv[0].px,pv[0].py); for(let j=1;j<pv.length;j++) ctx.lineTo(pv[j].px,pv[j].py); ctx.closePath();
-        ctx.fillStyle=cols2[i%cols2.length]; ctx.fill(); ctx.strokeStyle="rgba(59,158,255,0.25)"; ctx.lineWidth=1; ctx.setLineDash([3,3]); ctx.stroke(); ctx.setLineDash([]);
-      });
-    }
-    if (ov==="delaunay"||ov==="hybrid") {
-      for (const [a,b] of edgesArr) { const pa=toP(nodes[a]),pb=toP(nodes[b]);
-        ctx.beginPath(); ctx.moveTo(pa.px,pa.py); ctx.lineTo(pb.px,pb.py); ctx.strokeStyle="rgba(167,139,250,0.45)"; ctx.lineWidth=1.5; ctx.stroke();
-        const d=Math.hypot(nodes[a].x-nodes[b].x,nodes[a].y-nodes[b].y);
-        ctx.fillStyle="rgba(167,139,250,0.5)"; ctx.font="bold 9px monospace"; ctx.textAlign="center";
-        ctx.fillText(d.toFixed(1)+"m",(pa.px+pb.px)/2,(pa.py+pb.py)/2-6); ctx.textAlign="start";
-      }
-    }
-    for (const nd of nodes) { const p=toP(nd);
-      if(nd.alive){const g=ctx.createRadialGradient(p.px,p.py,0,p.px,p.py,14);g.addColorStop(0,"rgba(59,158,255,0.4)");g.addColorStop(1,"rgba(59,158,255,0)");ctx.fillStyle=g;ctx.beginPath();ctx.arc(p.px,p.py,14,0,Math.PI*2);ctx.fill();}
-      ctx.beginPath();ctx.arc(p.px,p.py,8,0,Math.PI*2);ctx.fillStyle=nd.alive?"#3b9eff":"#ef4444";ctx.fill();ctx.strokeStyle="#fff";ctx.lineWidth=2;ctx.stroke();
-      ctx.fillStyle="#fff";ctx.font="bold 9px monospace";ctx.textAlign="center";ctx.fillText(nd.id,p.px,p.py-14);
-      const nLat=(cLat+(nd.y-met.H/2)/111320).toFixed(4), nLn=(cLng+(nd.x-met.W/2)/(111320*Math.cos(cLat*Math.PI/180))).toFixed(4);
-      ctx.fillStyle="rgba(255,255,255,0.35)";ctx.font="7px monospace";ctx.fillText(nLat+","+nLn,p.px,p.py+18);ctx.textAlign="start";
-    }
-    ctx.fillStyle="rgba(200,200,200,0.35)";ctx.font="9px sans-serif";ctx.textAlign="right";ctx.fillText("© OpenStreetMap",cw-6,ch-6);ctx.textAlign="start";
-    ctx.fillStyle="rgba(59,158,255,0.55)";ctx.font="10px monospace";ctx.fillText("Zoom:"+z+" | Scroll=zoom · Drag=pan · Click=place",10,16);
-  }, [nodes, edgesArr, cellsArr, met, ov, env, cLat, cLng]);
-
   useEffect(() => {
     if (!done) return;
-    if (env === "Indoor") drawIndoor(); else drawOutdoor();
-  }, [done, drawIndoor, drawOutdoor, ov, env]);
+    draw();
+  }, [done, draw, ov, env]);
 
   // ─── CHARTS ───
   const drawChart = useCallback((ref, data, yKey, color, fill, unit) => {
@@ -403,109 +474,91 @@ export default function App() {
   // ─── MOUSE HANDLERS (Indoor) ───
   const iDown = (e) => {
     if (!met) return;
-    const r=indoorRef.current.getBoundingClientRect();
+    const r=canvasRef.current.getBoundingClientRect();
     const mx=(e.clientX-r.left)/r.width*met.W, my=(e.clientY-r.top)/r.height*met.H;
     if (e.button===2) return;
     let cl2=-1,cd=10/(r.width/met.W);
     nodes.forEach((n,i)=>{const d=Math.hypot(n.x-mx,n.y-my);if(d<cd){cd=d;cl2=i;}});
-    if(cl2>=0){dragRef.current=cl2;} else if(placement==="Manual"){
-      const nn=[...nodes,{id:nodes.length,x:mx,y:my,alive:true,batt:1,minN:0,area:0,nb:[]}];
-      const{edges:ne,cells:nc}=recompute(nn);setNodes([...nn]);setEdgesArr(ne);setCellsArr(nc);
-    }
+    if(cl2>=0){dragRef.current=cl2;}
   };
   const iMove = (e) => {
     if(dragRef.current<0||!met) return;
-    const r=indoorRef.current.getBoundingClientRect();
+    const r=canvasRef.current.getBoundingClientRect();
     const mx=Math.max(0,Math.min(met.W,(e.clientX-r.left)/r.width*met.W));
     const my=Math.max(0,Math.min(met.H,(e.clientY-r.top)/r.height*met.H));
     const nn=[...nodes];nn[dragRef.current]={...nn[dragRef.current],x:mx,y:my};
-    const{edges:ne,cells:nc,minDist}=recompute(nn);setNodes(nn);setEdgesArr(ne);setCellsArr(nc);setMet(m=>({...m,minDist}));
+    const sR=SENSORS[sensor].range;
+    const{edges:ne,cells:nc,minDist}=recompute(nn,sR*2);
+    const newCov=calcCov(nn,sR);
+    const newConn=calcConn(nn,ne);
+    setNodes(nn);setEdgesArr(ne);setCellsArr(nc);
+    setMet(m=>({...m,minDist,covPct:newCov,conn:newConn}));
   };
   const iUp = () => { dragRef.current = -1; };
   const iCtx = (e) => {
     e.preventDefault(); if(!met) return;
-    const r=indoorRef.current.getBoundingClientRect();
+    const r=canvasRef.current.getBoundingClientRect();
     const mx=(e.clientX-r.left)/r.width*met.W, my=(e.clientY-r.top)/r.height*met.H;
     let cl2=-1,cd=12/(r.width/met.W);
     nodes.forEach((n,i)=>{const d=Math.hypot(n.x-mx,n.y-my);if(d<cd){cd=d;cl2=i;}});
     if(cl2>=0){const nn=[...nodes];nn[cl2]={...nn[cl2],alive:!nn[cl2].alive};setNodes(nn);}
   };
 
-  // ─── MOUSE HANDLERS (Outdoor) ───
-  const oConsts = () => {
-    const c=outdoorRef.current; if(!c||!met) return null;
-    const cw2=c.parentElement?.clientWidth||700,ch2=500,z=mZoom.current;
-    const ct2=latLngToTile(cLat,cLng,z);
-    return{cw:cw2,ch:ch2,z,ox:ct2.x-(cw2/256)/2+mOff.current.x/256,oy:ct2.y-(ch2/256)/2+mOff.current.y/256};
-  };
-  const pxToNode = (px,py) => {
-    const mc=oConsts(); if(!mc) return null;
-    const ll=tileToLatLng(mc.ox+px/256,mc.oy+py/256,mc.z);
-    return{x:(ll.lng-cLng)*111320*Math.cos(cLat*Math.PI/180)+met.W/2, y:(ll.lat-cLat)*111320+met.H/2};
-  };
-  const nodeToPx = (nd) => {
-    const mc=oConsts(); if(!mc) return{px:0,py:0};
-    const nLat=cLat+(nd.y-met.H/2)/111320, nLng2=cLng+(nd.x-met.W/2)/(111320*Math.cos(cLat*Math.PI/180));
-    const t=latLngToTile(nLat,nLng2,mc.z);
-    return{px:(t.x-mc.ox)*256,py:(t.y-mc.oy)*256};
-  };
-  const oDown = (e) => {
-    if(!met) return;
-    const r=outdoorRef.current.getBoundingClientRect();
-    const px=e.clientX-r.left,py=e.clientY-r.top;
-    let cl2=-1,cd=15;
-    nodes.forEach((n,i)=>{const p=nodeToPx(n);const d=Math.hypot(p.px-px,p.py-py);if(d<cd){cd=d;cl2=i;}});
-    if(cl2>=0){dragRef.current=cl2;} else {mDragS.current={x:px,y:py,ox:mOff.current.x,oy:mOff.current.y};}
-  };
-  const oMove = (e) => {
-    if(!met) return;
-    const r=outdoorRef.current.getBoundingClientRect();
-    const px=e.clientX-r.left,py=e.clientY-r.top;
-    if(dragRef.current>=0){
-      const np=pxToNode(px,py); if(np){
-        const nn=[...nodes];nn[dragRef.current]={...nn[dragRef.current],x:np.x,y:np.y};
-        const{edges:ne,cells:nc,minDist}=recompute(nn);setNodes(nn);setEdgesArr(ne);setCellsArr(nc);setMet(m=>({...m,minDist}));
-      }
-    } else if(mDragS.current){
-      mOff.current={x:mDragS.current.ox-(px-mDragS.current.x),y:mDragS.current.oy-(py-mDragS.current.y)};
-      drawOutdoor();
-    }
-  };
-  const oUp = (e) => {
-    if(dragRef.current>=0){dragRef.current=-1;return;}
-    if(mDragS.current){
-      const r=outdoorRef.current.getBoundingClientRect();
-      const px=e.clientX-r.left,py=e.clientY-r.top;
-      if(Math.abs(px-mDragS.current.x)<3&&Math.abs(py-mDragS.current.y)<3&&placement==="Manual"){
-        const np=pxToNode(px,py);
-        if(np){const nn=[...nodes,{id:nodes.length,x:np.x,y:np.y,alive:true,batt:1,minN:0,area:0,nb:[]}];const{edges:ne,cells:nc}=recompute(nn);setNodes([...nn]);setEdgesArr(ne);setCellsArr(nc);}
-      }
-      mDragS.current=null;
-    }
-  };
-  const oWheel = (e) => {
-    e.preventDefault();
-    const nz=Math.max(10,Math.min(19,mZoom.current+(e.deltaY<0?1:-1)));
-    if(nz!==mZoom.current){mZoom.current=nz;mOff.current={x:0,y:0};drawOutdoor();}
-  };
-  const oCtx = (e) => {
-    e.preventDefault(); if(!met) return;
-    const r=outdoorRef.current.getBoundingClientRect(); const px=e.clientX-r.left,py=e.clientY-r.top;
-    let cl2=-1,cd=15;
-    nodes.forEach((n,i)=>{const p=nodeToPx(n);const d=Math.hypot(p.px-px,p.py-py);if(d<cd){cd=d;cl2=i;}});
-    if(cl2>=0){const nn=[...nodes];nn[cl2]={...nn[cl2],alive:!nn[cl2].alive};setNodes(nn);}
-  };
 
-  // Recs
+  // ─── RECOMMENDATIONS ───
   const recs = [];
+  let healthScore = 0;
   if (met) {
-    const opt = met.sR * 1.5, req = Math.ceil(met.totalArea / (Math.PI * met.sR * met.sR * 0.8));
-    recs.push({ t: "info", text: "Optimal spacing: " + opt.toFixed(1) + "m · Recommended: " + req + " nodes" });
-    if (met.n < req) recs.push({ t: "warn", text: "Add " + (req - met.n) + " more nodes for full coverage" });
-    if (!met.conn) recs.push({ t: "err", text: "Network disconnected! Reposition or add relay nodes." });
-    if (met.covPct < 80) recs.push({ t: "warn", text: "Coverage only " + met.covPct.toFixed(1) + "%" });
-    if (met.battLife < 30) recs.push({ t: "warn", text: "Battery < 30 days. Use Li-ion or increase TX interval." });
-    recs.push({ t: "info", text: "Min dist: " + met.minDist.toFixed(2) + "m · Avg: " + met.avgD.toFixed(2) + "m · PL: " + met.pl.toFixed(1) + " dB" });
+    const { n, sR, covPct, conn, battLife, firstDeath, avgD, minDist, pl, totalArea } = met;
+    const commRange = sR * 2;
+    const req = Math.ceil(totalArea / (Math.PI * sR * sR * 0.8));
+    const optSpacing = +(sR * Math.sqrt(3)).toFixed(1);
+    const tooClose = minDist < sR * 0.5;
+    const tooSparse = avgD > sR * 3;
+
+    // Health score: Coverage 40pts + Connectivity 30pts + Battery 20pts + Spacing 10pts
+    healthScore = Math.round(
+      Math.min(40, (covPct / 100) * 40) +
+      (conn ? 30 : 0) +
+      Math.min(20, (battLife / 400) * 20) +
+      (tooClose ? 0 : tooSparse ? 5 : 10)
+    );
+
+    // Coverage
+    if (covPct >= 95)
+      recs.push({ t: "ok", cat: "Coverage", text: `Excellent — ${covPct.toFixed(1)}% area covered` });
+    else if (covPct >= 80)
+      recs.push({ t: "warn", cat: "Coverage", text: `Coverage ${covPct.toFixed(1)}% — add ${Math.max(0, req - n)} node(s) to reach 95%+` });
+    else
+      recs.push({ t: "err", cat: "Coverage", text: `Low coverage ${covPct.toFixed(1)}% — need ${req - n} more nodes (recommended: ${req})` });
+
+    // Connectivity
+    if (conn)
+      recs.push({ t: "ok", cat: "Connectivity", text: `Fully connected — all ${n} nodes reachable via Delaunay mesh` });
+    else
+      recs.push({ t: "err", cat: "Connectivity", text: `DISCONNECTED — isolated nodes detected. Add relay nodes or keep distances < ${commRange.toFixed(0)}m` });
+
+    // Battery
+    if (battLife >= 200)
+      recs.push({ t: "ok", cat: "Battery", text: `Long lifetime: ${battLife} days · First node death: day ${firstDeath}` });
+    else if (battLife >= 60)
+      recs.push({ t: "warn", cat: "Battery", text: `Moderate lifetime: ${battLife} days · Try higher-capacity battery or longer TX interval` });
+    else
+      recs.push({ t: "err", cat: "Battery", text: `Short lifetime: ${battLife} days · Use Li-ion 3000mAh and reduce TX frequency` });
+
+    // Placement / spacing
+    if (tooClose)
+      recs.push({ t: "warn", cat: "Placement", text: `Nodes too close — min dist ${minDist.toFixed(1)}m (threshold: ${(sR * 0.5).toFixed(1)}m). Redundant overlap.` });
+    else if (tooSparse)
+      recs.push({ t: "warn", cat: "Placement", text: `Nodes too spread — avg dist ${avgD.toFixed(1)}m. Coverage gaps likely. Optimal spacing: ${optSpacing}m` });
+    else
+      recs.push({ t: "ok", cat: "Placement", text: `Good spacing — min ${minDist.toFixed(1)}m, avg ${avgD.toFixed(1)}m (optimal: ${optSpacing}m)` });
+
+    // RF signal
+    recs.push({ t: pl < 70 ? "ok" : "info", cat: "RF Signal", text: `Path loss ${pl.toFixed(1)} dB at avg dist ${avgD.toFixed(1)}m · Comm range: ${commRange.toFixed(0)}m (${env} model)` });
+
+    // Node count
+    recs.push({ t: n >= req ? "info" : "warn", cat: "Nodes", text: `${n} deployed · ${req} recommended for 80% efficiency · Sensor range: ${sR}m` });
   }
 
   // ══════════════ AUTH ══════════════
@@ -560,16 +613,18 @@ export default function App() {
           <FLab>Sensor</FLab>
           <FSel value={sensor} onChange={e => setSensor(e.target.value)}>{Object.entries(SENSORS).map(([k, v]) => <option key={k} value={k}>{k} ({v.range}m)</option>)}</FSel>
           <FLab>Placement</FLab>
-          <div style={{ display: "flex", gap: 4 }}>{["Random", "Grid", "Manual"].map(p => <button key={p} style={{ flex: 1, padding: "7px 0", borderRadius: 6, border: "1px solid " + (placement === p ? "#3b9eff" : "rgba(100,180,255,0.1)"), background: placement === p ? "rgba(59,158,255,0.12)" : "transparent", color: placement === p ? "#3b9eff" : "#5a7a9a", cursor: "pointer", fontSize: 10, fontWeight: 600, fontFamily: "'DM Sans'" }} onClick={() => setPlacement(p)}>{p}</button>)}</div>
+          <div style={{ padding: "7px 10px", borderRadius: 6, border: "1px solid #3b9eff", background: "rgba(59,158,255,0.12)", color: "#3b9eff", fontSize: 10, fontWeight: 600, fontFamily: "'DM Sans'", textAlign: "center" }}>Hybrid (Voronoi–Delaunay)</div>
           <ST>Energy</ST>
           <FLab>Battery</FLab>
           <FSel value={battType} onChange={e => { setBattType(e.target.value); setCapacity(BATTS[e.target.value].cap); }}>{Object.entries(BATTS).map(([k, v]) => <option key={k} value={k}>{k} ({v.v}V)</option>)}</FSel>
           <FLab>Capacity (mAh)</FLab><FIn type="number" value={capacity} onChange={e => setCapacity(+e.target.value || 100)} />
           <FLab>TX Interval (s)</FLab><FIn type="number" value={txInt} onChange={e => setTxInt(+e.target.value || 1)} />
           {env === "Indoor" && <><ST>Propagation</ST><FLab>PL Exponent: {ple}</FLab><input type="range" min={2} max={5} step={0.1} value={ple} onChange={e => setPle(+e.target.value)} style={{ width: "100%", accentColor: "#3b9eff" }} /><FLab>Wall Atten: {wallAtt} dB</FLab><input type="range" min={0} max={25} step={1} value={wallAtt} onChange={e => setWallAtt(+e.target.value)} style={{ width: "100%", accentColor: "#3b9eff" }} /></>}
-          {env === "Outdoor" && <><ST>Location</ST><FLab>Lat</FLab><FIn type="number" step={0.0001} value={cLat} onChange={e => setCLat(+e.target.value)} /><FLab>Lng</FLab><FIn type="number" step={0.0001} value={cLng} onChange={e => setCLng(+e.target.value)} /><div style={{ fontSize: 9, color: "#3a5570", marginTop: 4 }}>Scroll=zoom · Drag=pan · Click=place (Manual)</div></>}
+          {env === "Outdoor" && <><ST>Propagation</ST><FLab>PL Exponent: {ple}</FLab><input type="range" min={2} max={5} step={0.1} value={ple} onChange={e => setPle(+e.target.value)} style={{ width: "100%", accentColor: "#3b9eff" }} /></>}
           <div style={{ marginTop: 12, padding: 10, borderRadius: 8, background: "rgba(59,158,255,0.04)", border: "1px solid rgba(100,180,255,0.1)", fontSize: 9, lineHeight: 1.6, color: "#5a7a9a", fontFamily: "monospace" }}><b style={{ color: "#3b9eff" }}>Assumptions:</b> E_tx=50nJ/bit · Amp=100pJ/bit/m² · E_rx=50nJ/bit · Pkt=4000b</div>
-          <button onClick={runSim} style={{ width: "100%", marginTop: 12, padding: 14, borderRadius: 10, border: "none", cursor: "pointer", fontSize: 14, fontWeight: 700, background: "linear-gradient(135deg,#3b9eff,#1d7cd6,#22d3ee)", color: "#fff", boxShadow: "0 4px 20px rgba(59,158,255,0.2)", fontFamily: "'DM Sans'" }}>▶ Run Simulation</button>
+          <button onClick={runSim} disabled={loading} style={{ width: "100%", marginTop: 12, padding: 14, borderRadius: 10, border: "none", cursor: loading ? "not-allowed" : "pointer", fontSize: 14, fontWeight: 700, background: loading ? "rgba(59,158,255,0.3)" : "linear-gradient(135deg,#3b9eff,#1d7cd6,#22d3ee)", color: "#fff", boxShadow: "0 4px 20px rgba(59,158,255,0.2)", fontFamily: "'DM Sans'", transition: "all 0.2s" }}>
+            {loading ? "⏳ Computing..." : "▶ Run Simulation"}
+          </button>
         </div>
 
         {/* CONTENT */}
@@ -592,9 +647,40 @@ export default function App() {
               </div>
               {/* VIZ */}
               {tab === "viz" && <div style={{ background: "#0b1120", border: "1px solid rgba(100,180,255,0.1)", borderRadius: 10, overflow: "hidden" }}>
-                <div style={{ fontSize: 10, color: "#3a5570", padding: "6px 12px", borderBottom: "1px solid rgba(100,180,255,0.06)", fontFamily: "monospace" }}>{env === "Indoor" ? "Drag=move · Right-click=kill/revive · Click=place (Manual)" : "Drag node=move · Scroll=zoom · Drag bg=pan · Click=place (Manual) · Right-click=kill"}</div>
-                {env === "Indoor" && <canvas ref={indoorRef} style={{ display: "block", width: "100%", cursor: "crosshair" }} onMouseDown={iDown} onMouseMove={iMove} onMouseUp={iUp} onMouseLeave={iUp} onContextMenu={iCtx} />}
-                {env === "Outdoor" && <canvas ref={outdoorRef} style={{ display: "block", width: "100%", height: 500, cursor: "grab" }} onMouseDown={oDown} onMouseMove={oMove} onMouseUp={oUp} onMouseLeave={() => { dragRef.current = -1; mDragS.current = null; }} onWheel={oWheel} onContextMenu={oCtx} />}
+                <div style={{ fontSize: 10, color: "#3a5570", padding: "6px 12px", borderBottom: "1px solid rgba(100,180,255,0.06)", fontFamily: "monospace" }}>{"Drag=move · Right-click=kill/revive · Click=place (Manual)"}</div>
+                <canvas ref={canvasRef} style={{ display: "block", width: "100%", cursor: "crosshair" }} onMouseDown={iDown} onMouseMove={iMove} onMouseUp={iUp} onMouseLeave={iUp} onContextMenu={iCtx} />
+                {/* ITERATION PANEL — only for Hybrid */}
+                {iterHistory.length > 0 && (
+                  <div style={{ padding: "10px 14px", borderTop: "1px solid rgba(100,180,255,0.08)", background: "rgba(6,10,20,0.6)" }}>
+                    <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 8 }}>
+                      <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5, color: "#3b9eff" }}>Iterations</span>
+                      <button onClick={iterPlaying ? stopPlay : playIters} style={{ padding: "4px 12px", borderRadius: 6, border: "1px solid rgba(59,158,255,0.3)", background: iterPlaying ? "rgba(239,68,68,0.1)" : "rgba(59,158,255,0.1)", color: iterPlaying ? "#ef4444" : "#3b9eff", cursor: "pointer", fontSize: 10, fontWeight: 700, fontFamily: "'DM Sans'" }}>
+                        {iterPlaying ? "■ Stop" : "▶ Play"}
+                      </button>
+                      <span style={{ fontSize: 10, color: "#5a7a9a", fontFamily: "monospace" }}>
+                        {iterIdx + 1} / {iterHistory.length} &nbsp;|&nbsp;
+                        Coverage: <b style={{ color: "#22d3ee" }}>{iterHistory[iterIdx]?.coverage}%</b> &nbsp;|&nbsp;
+                        {iterHistory[iterIdx]?.connected ? <span style={{ color: "#10b981" }}>Connected ✓</span> : <span style={{ color: "#ef4444" }}>Disconnected ✗</span>}
+                        {iterIdx === iterHistory.reduce((bi, it, i) => (it.coverage > iterHistory[bi].coverage ? i : bi), 0) && <span style={{ marginLeft: 8, color: "#f59e0b", fontWeight: 700 }}>★ Best</span>}
+                      </span>
+                    </div>
+                    <input type="range" min={0} max={iterHistory.length - 1} value={iterIdx}
+                      onChange={e => goToIter(+e.target.value)}
+                      style={{ width: "100%", accentColor: "#3b9eff", cursor: "pointer" }} />
+                    {/* Mini coverage chart per iteration */}
+                    <div style={{ display: "flex", gap: 3, marginTop: 8, alignItems: "flex-end", height: 36 }}>
+                      {iterHistory.map((it, i) => (
+                        <div key={i} onClick={() => goToIter(i)} title={`Iter ${i + 1}: ${it.coverage}%`}
+                          style={{ flex: 1, height: (it.coverage / 100) * 36 + "px", minHeight: 3, borderRadius: 2, cursor: "pointer", transition: "opacity 0.2s",
+                            background: i === iterIdx ? "#3b9eff" : it.connected ? "rgba(16,185,129,0.5)" : "rgba(239,68,68,0.4)",
+                            outline: i === iterIdx ? "1px solid #3b9eff" : "none" }} />
+                      ))}
+                    </div>
+                    <div style={{ display: "flex", justifyContent: "space-between", fontSize: 8, color: "#3a5570", fontFamily: "monospace", marginTop: 2 }}>
+                      <span>Iter 1 (Random)</span><span>→ Optimization →</span><span>Iter {iterHistory.length} (Final)</span>
+                    </div>
+                  </div>
+                )}
               </div>}
               {/* CHARTS */}
               {tab === "charts" && <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
@@ -609,16 +695,14 @@ export default function App() {
               {tab === "table" && <div style={{ background: "#0b1120", border: "1px solid rgba(100,180,255,0.1)", borderRadius: 10, overflow: "hidden" }}>
                 <div style={{ maxHeight: 400, overflowY: "auto" }}>
                   <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11, fontFamily: "monospace" }}>
-                    <thead><tr>{["ID", "Status", "X(m)", "Y(m)", env === "Outdoor" ? "Lat,Lng" : "V.Area", "MinN", "Action"].map(h => <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontSize: 8, textTransform: "uppercase", letterSpacing: 1, color: "#3a5570", borderBottom: "1px solid rgba(100,180,255,0.08)", fontWeight: 600 }}>{h}</th>)}</tr></thead>
+                    <thead><tr>{["ID", "Status", "X(m)", "Y(m)", "V.Area", "MinN", "Action"].map(h => <th key={h} style={{ padding: "8px 10px", textAlign: "left", fontSize: 8, textTransform: "uppercase", letterSpacing: 1, color: "#3a5570", borderBottom: "1px solid rgba(100,180,255,0.08)", fontWeight: 600 }}>{h}</th>)}</tr></thead>
                     <tbody>{nodes.map(nd => {
-                      const nLat2 = (cLat + (nd.y - (met?.H || aH) / 2) / 111320).toFixed(5);
-                      const nLng2 = (cLng + (nd.x - (met?.W || aW) / 2) / (111320 * Math.cos(cLat * Math.PI / 180))).toFixed(5);
                       return <tr key={nd.id} style={{ borderBottom: "1px solid rgba(100,180,255,0.04)" }}>
                         <td style={tdS}><b style={{ color: "#3b9eff" }}>#{nd.id}</b></td>
                         <td style={tdS}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: nd.alive ? "#10b981" : "#ef4444", marginRight: 4, boxShadow: "0 0 4px " + (nd.alive ? "rgba(16,185,129,0.4)" : "rgba(239,68,68,0.4)") }} />{nd.alive ? "Alive" : "Dead"}</td>
                         <td style={tdS}>{nd.x.toFixed(1)}</td>
                         <td style={tdS}>{nd.y.toFixed(1)}</td>
-                        <td style={tdS}>{env === "Outdoor" ? nLat2 + "," + nLng2 : (nd.area || 0).toFixed(1) + "m²"}</td>
+                        <td style={tdS}>{(nd.area || 0).toFixed(1)}m²</td>
                         <td style={tdS}>{(nd.minN || 0).toFixed(1)}m</td>
                         <td style={tdS}><button style={{ padding: "3px 8px", borderRadius: 4, border: "1px solid " + (nd.alive ? "rgba(239,68,68,0.2)" : "rgba(16,185,129,0.2)"), background: "transparent", color: nd.alive ? "#ef4444" : "#10b981", cursor: "pointer", fontSize: 9, fontWeight: 600, fontFamily: "'DM Sans'" }} onClick={() => { const nn = [...nodes]; nn[nd.id] = { ...nn[nd.id], alive: !nn[nd.id].alive }; setNodes(nn); }}>{nd.alive ? "Kill" : "Revive"}</button></td>
                       </tr>;
@@ -628,9 +712,39 @@ export default function App() {
               </div>}
               {/* RECS */}
               <div style={{ background: "#0b1120", border: "1px solid rgba(100,180,255,0.1)", borderRadius: 10, overflow: "hidden" }}>
-                <div style={{ padding: "8px 14px", borderBottom: "1px solid rgba(100,180,255,0.06)", fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5, color: "#3b9eff" }}>Recommendations</div>
+                <div style={{ padding: "8px 14px", borderBottom: "1px solid rgba(100,180,255,0.06)", display: "flex", alignItems: "center", justifyContent: "space-between" }}>
+                  <span style={{ fontSize: 9, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1.5, color: "#3b9eff" }}>Recommendations</span>
+                  {met && (
+                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                      <div style={{ width: 80, height: 5, borderRadius: 3, background: "rgba(100,180,255,0.1)", overflow: "hidden" }}>
+                        <div style={{ height: "100%", width: healthScore + "%", borderRadius: 3, background: healthScore >= 80 ? "#10b981" : healthScore >= 50 ? "#f59e0b" : "#ef4444", transition: "width 0.4s" }} />
+                      </div>
+                      <span style={{ fontSize: 11, fontWeight: 700, fontFamily: "monospace", color: healthScore >= 80 ? "#10b981" : healthScore >= 50 ? "#f59e0b" : "#ef4444" }}>
+                        {healthScore}/100
+                      </span>
+                    </div>
+                  )}
+                </div>
                 <div style={{ padding: 10, display: "flex", flexDirection: "column", gap: 5 }}>
-                  {recs.map((r, i) => <div key={i} style={{ padding: "8px 12px", borderRadius: 8, fontSize: 12, lineHeight: 1.5, background: r.t === "err" ? "rgba(239,68,68,0.06)" : r.t === "warn" ? "rgba(245,158,11,0.06)" : "rgba(59,158,255,0.05)", border: "1px solid " + (r.t === "err" ? "rgba(239,68,68,0.15)" : r.t === "warn" ? "rgba(245,158,11,0.15)" : "rgba(59,158,255,0.12)"), color: r.t === "err" ? "#fca5a5" : r.t === "warn" ? "#fcd34d" : "#7ec8ff" }}>{r.t === "err" ? "⚠ " : r.t === "warn" ? "⚡ " : "💡 "}{r.text}</div>)}
+                  {!met && <div style={{ padding: "16px 12px", textAlign: "center", color: "#3a5570", fontSize: 12 }}>Run a simulation to see recommendations</div>}
+                  {recs.map((r, i) => {
+                    const colors = {
+                      ok:   { bg: "rgba(16,185,129,0.06)",  border: "rgba(16,185,129,0.2)",  text: "#6ee7b7", icon: "✓" },
+                      warn: { bg: "rgba(245,158,11,0.06)",  border: "rgba(245,158,11,0.2)",  text: "#fcd34d", icon: "⚡" },
+                      err:  { bg: "rgba(239,68,68,0.06)",   border: "rgba(239,68,68,0.2)",   text: "#fca5a5", icon: "⚠" },
+                      info: { bg: "rgba(59,158,255,0.05)",  border: "rgba(59,158,255,0.15)", text: "#7ec8ff", icon: "·" },
+                    };
+                    const c = colors[r.t] || colors.info;
+                    return (
+                      <div key={i} style={{ padding: "7px 10px", borderRadius: 8, fontSize: 12, lineHeight: 1.5, background: c.bg, border: "1px solid " + c.border, color: c.text, display: "flex", gap: 8, alignItems: "flex-start" }}>
+                        <span style={{ flexShrink: 0, fontSize: 11, marginTop: 1 }}>{c.icon}</span>
+                        <div style={{ flex: 1 }}>
+                          <span style={{ fontSize: 8, fontWeight: 700, textTransform: "uppercase", letterSpacing: 1, opacity: 0.6, marginRight: 6 }}>{r.cat}</span>
+                          {r.text}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>
