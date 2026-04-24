@@ -34,6 +34,62 @@ const ENERGY = {
 };
 
 // ──────────────────────────────────────────
+// PLACEMENT OPTIMIZER (Discrete Lloyd-style)
+// ──────────────────────────────────────────
+function lloydRelaxation(initNodes, width, height, sensorRange, { iterations = 25, lerp = 0.6 } = {}) {
+  if (!Array.isArray(initNodes) || initNodes.length < 3) return initNodes;
+
+  let nodes = initNodes.map((n, i) => ({
+    id: i,
+    x: typeof n.x === 'number' ? n.x : 0,
+    y: typeof n.y === 'number' ? n.y : 0,
+    alive: true,
+  }));
+
+  const gridStep = Math.max(1.5, Math.min(width, height) / 30);
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+  for (let iter = 0; iter <= iterations; iter++) {
+    // Assign each grid sample to nearest node, move nodes toward centroid.
+    const sumX = new Float64Array(nodes.length);
+    const sumY = new Float64Array(nodes.length);
+    const cnt = new Int32Array(nodes.length);
+
+    for (let gx = gridStep / 2; gx < width; gx += gridStep) {
+      for (let gy = gridStep / 2; gy < height; gy += gridStep) {
+        let near = 0;
+        let nearD = Infinity;
+        for (let j = 0; j < nodes.length; j++) {
+          const d = Math.hypot(nodes[j].x - gx, nodes[j].y - gy);
+          if (d < nearD) { nearD = d; near = j; }
+        }
+        sumX[near] += gx;
+        sumY[near] += gy;
+        cnt[near]++;
+      }
+    }
+
+    nodes = nodes.map((p, i) => {
+      if (cnt[i] === 0) return p;
+      const cx = sumX[i] / cnt[i];
+      const cy = sumY[i] / cnt[i];
+      return {
+        ...p,
+        x: clamp(p.x + (cx - p.x) * lerp, width * 0.03, width * 0.97),
+        y: clamp(p.y + (cy - p.y) * lerp, height * 0.03, height * 0.97),
+      };
+    });
+
+    // Early exit heuristic: once coverage likely saturates and connectivity possible.
+    // (Exact coverage/connectivity are computed in runSimulation anyway.)
+    if (iter >= iterations) break;
+  }
+
+  // Keep ids stable 0..N-1
+  return nodes.map((n, i) => ({ ...n, id: i, alive: true }));
+}
+
+// ──────────────────────────────────────────
 // DELAUNAY TRIANGULATION (Bowyer-Watson)
 // ──────────────────────────────────────────
 function delaunayTriangulation(points) {
@@ -499,6 +555,34 @@ export function runSimulation(config) {
     timeSeries,
     recommendations,
   };
+}
+
+/**
+ * Optimize a manual placement (or any provided nodes array) using Lloyd relaxation,
+ * and return before/after simulation results.
+ */
+export function optimizePlacement(config) {
+  const {
+    areaWidth, areaHeight, sensorType,
+  } = config;
+
+  if (!Array.isArray(config.nodes) || config.nodes.length < 3) {
+    throw new Error('optimizePlacement requires config.nodes with length >= 3');
+  }
+
+  const sensorInfo = SENSORS[sensorType];
+  if (!sensorInfo) {
+    throw new Error(`Unknown sensorType: ${sensorType}`);
+  }
+
+  const before = runSimulation({ ...config, placement: 'Manual', nodes: config.nodes });
+  const optimizedNodes = lloydRelaxation(config.nodes, areaWidth, areaHeight, sensorInfo.range, {
+    iterations: 25,
+    lerp: 0.6,
+  });
+  const after = runSimulation({ ...config, placement: 'Hybrid', nodes: optimizedNodes });
+
+  return { before, after };
 }
 
 export { SENSORS, BATTERIES, ENERGY };

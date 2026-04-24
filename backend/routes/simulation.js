@@ -1,7 +1,7 @@
 import express from 'express';
 import jwt from 'jsonwebtoken';
 import Simulation from '../models/Simulation.js';
-import { runSimulation } from '../services/simulationService.js';
+import { optimizePlacement, runSimulation } from '../services/simulationService.js';
 
 const router = express.Router();
 
@@ -22,6 +22,16 @@ function auth(req, res, next) {
 router.post('/simulate', (req, res) => {
   try {
     const results = runSimulation(req.body);
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/optimize — optimize a provided manual placement (no auth required)
+router.post('/optimize', (req, res) => {
+  try {
+    const results = optimizePlacement(req.body);
     res.json(results);
   } catch (err) {
     res.status(500).json({ error: err.message });

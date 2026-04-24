@@ -23,6 +23,7 @@ The user inputs:
 - Sensor type (Temperature / Humidity / Motion)
 - Battery type (Li-ion / AA / Coin cell)
 - Transmission interval (how often each node sends data, in seconds)
+- (Optional) Manual node positions (Optimize tab)
 
 The simulator then:
 1. Places the nodes optimally using an iterative algorithm
@@ -31,6 +32,7 @@ The simulator then:
 4. Checks if all nodes can reach each other
 5. Simulates 400 days of battery drain
 6. Shows all results visually with charts and recommendations
+7. (Optional) Lets the user manually place nodes and optimize them (before/after comparison)
 
 ---
 
@@ -76,6 +78,21 @@ The classic Lloyd's algorithm uses Voronoi circumcenters to find centroids. But 
 
 **Why 60% lerp (not 100% jump)?**
 Jumping 100% to the centroid causes nodes to oscillate back and forth between iterations. Moving 60% gives smooth, stable convergence.
+
+---
+
+## Manual Placement → Optimization (Before/After)
+
+In addition to the main simulation flow, the simulator includes an **Optimize** workflow:
+
+1. **Manual placement**: the user clicks to place nodes (and can drag/right-click to adjust).
+2. **Optimization**: the app sends the manual layout to the backend endpoint:
+
+```
+POST /api/optimize
+```
+
+3. **Result**: the backend returns **before** (manual) and **after** (optimized) results, and the UI renders them side-by-side with metric deltas (coverage, connectivity, battery life, spacing, path loss).
 
 ---
 
@@ -333,6 +350,7 @@ After simulation, the system generates automated recommendations based on the re
 ┌─────────────────────────────────────────────────────┐
 │                  BACKEND (Node.js)                  │
 │  POST /api/simulate    → run simulation             │
+│  POST /api/optimize    → optimize manual placement  │
 │  POST /api/save        → save result (JWT auth)     │
 │  GET  /api/history     → user's past simulations    │
 └─────────────────────────────────────────────────────┘
