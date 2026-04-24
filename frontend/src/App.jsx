@@ -171,6 +171,13 @@ export default function App() {
   const [done,setDone]=useState(false);
   const [loading,setLoading]=useState(false);
 
+  // Iteration playback (Lloyd history)
+  const [iterHistory,setIterHistory]=useState([]); // [{iter, pts, edges, cells, coverage, connected, minDist, avgD}]
+  const [iterIdx,setIterIdx]=useState(0);
+  const [iterPlaying,setIterPlaying]=useState(false);
+  const bestIterRef=useRef(0);
+  const iterTimerRef=useRef(null);
+
   // Optimize sub-state
   const [optPhase,setOptPhase]=useState("place");
   const [userNodes,setUserNodes]=useState([]);
@@ -215,6 +222,43 @@ export default function App() {
     return{edges:ed,cells:cl,minDist:gMin===Infinity?0:gMin,avgD:dc>0?td/dc:0};
   },[]);
 
+  const goToIter=useCallback((idx)=>{
+    if(!iterHistory.length)return;
+    const clamped=Math.max(0,Math.min(iterHistory.length-1,idx));
+    setIterIdx(clamped);
+    const it=iterHistory[clamped];
+    setNodes(it.pts.map(p=>({...p})));
+    setEdges(it.edges);
+    setCells(it.cells);
+    setMet(m=>m?({...m,minDist:it.minDist,avgD:it.avgD,covPct:it.coverage,conn:it.connected,n:it.pts.length}):m);
+  },[iterHistory]);
+
+  const stopPlay=useCallback(()=>{
+    if(iterTimerRef.current){clearInterval(iterTimerRef.current);iterTimerRef.current=null;}
+    setIterPlaying(false);
+  },[]);
+
+  const playIters=useCallback(()=>{
+    if(!iterHistory.length)return;
+    if(iterTimerRef.current)return;
+    setIterPlaying(true);
+    iterTimerRef.current=setInterval(()=>{
+      setIterIdx(prev=>{
+        const next=(prev+1)%iterHistory.length;
+        return next;
+      });
+    },600);
+  },[iterHistory.length]);
+
+  useEffect(()=>{
+    if(!iterPlaying)return;
+    goToIter(iterIdx);
+  },[iterIdx,iterPlaying,goToIter]);
+
+  useEffect(()=>{
+    return ()=>{ if(iterTimerRef.current) clearInterval(iterTimerRef.current); };
+  },[]);
+
   const simBatt=useCallback((pts,sP,bV)=>{
     const{avgD}=buildGraph(pts);
     const rpd=(24*3600)/txInt,epr=ePR(avgD),bJ=mAhToJ(capacity,bV);
@@ -231,14 +275,14 @@ export default function App() {
   },[txInt,capacity,buildGraph,calcCov,sensorRange]);
 
   const lloydOpt=useCallback((initPts)=>{
+    // Returns final/best points (used for Optimize fallback mode).
     let pts=initPts.map((p,i)=>({...p,id:i}));
     const gs=Math.max(1.5,Math.min(aW,aH)/30);
-    let best=null,bestCov=-1;
+    let bestPts=pts,bestCov=-1,bestConn=false;
     for(let iter=0;iter<=25;iter++){
       const{edges:ed}=buildGraph(pts);
       const cov=calcCov(pts,sensorRange),conn=calcConn(pts,ed);
-      if(cov>bestCov||(conn&&!best?.conn)){best={pts:pts.map(p=>({...p})),cov,conn};bestCov=cov;}
-      if(cov>=95&&conn)break;
+      if(cov>bestCov||(conn&&!bestConn)){bestPts=pts.map(p=>({...p}));bestCov=cov;bestConn=conn;}
       const sumX=new Float64Array(pts.length),sumY=new Float64Array(pts.length),cnt=new Int32Array(pts.length);
       for(let gx=gs/2;gx<aW;gx+=gs)for(let gy=gs/2;gy<aH;gy+=gs){
         let near=0,nearD=Infinity;
@@ -247,24 +291,59 @@ export default function App() {
       }
       pts=pts.map((p,i)=>cnt[i]===0?p:{...p,x:Math.max(aW*.03,Math.min(aW*.97,p.x+(sumX[i]/cnt[i]-p.x)*.6)),y:Math.max(aH*.03,Math.min(aH*.97,p.y+(sumY[i]/cnt[i]-p.y)*.6))});
     }
-    return best?.pts||pts;
+    return bestPts;
   },[aW,aH,sensorRange,buildGraph,calcCov,calcConn]);
 
   const runSim=useCallback(()=>{
     setLoading(true);
     setTimeout(()=>{
       const bV=BATTS[battType].v;
+      // Build per-iteration history (20 iters) and pick best by coverage (connected preferred).
       let pts=Array.from({length:numNodes},(_,i)=>({id:i,x:Math.random()*aW*.85+aW*.075,y:Math.random()*aH*.85+aH*.075,alive:true}));
-      pts=lloydOpt(pts);
-      const{edges:ed,cells:cl,minDist,avgD}=buildGraph(pts);
-      const covPct=calcCov(pts,sensorRange),conn=calcConn(pts,ed);
+      const gs=Math.max(1.5,Math.min(aW,aH)/30);
+      const hist=[];
+      let bestIdx=0,bestCov=-1,bestConn=false;
+
+      for(let iter=0;iter<20;iter++){
+        const g=buildGraph(pts);
+        const cov=calcCov(pts,sensorRange);
+        const conn=calcConn(pts,g.edges);
+        const entry={
+          iter,
+          pts:pts.map(p=>({...p})),
+          edges:g.edges,
+          cells:g.cells,
+          coverage:cov,
+          connected:conn,
+          minDist:g.minDist,
+          avgD:g.avgD,
+        };
+        hist.push(entry);
+        if(cov>bestCov||(conn&&!bestConn)){bestCov=cov;bestConn=conn;bestIdx=iter;}
+
+        const sumX=new Float64Array(pts.length),sumY=new Float64Array(pts.length),cnt=new Int32Array(pts.length);
+        for(let gx=gs/2;gx<aW;gx+=gs)for(let gy=gs/2;gy<aH;gy+=gs){
+          let near=0,nearD=Infinity;
+          for(let j=0;j<pts.length;j++){const d=Math.hypot(pts[j].x-gx,pts[j].y-gy);if(d<nearD){nearD=d;near=j;}}
+          sumX[near]+=gx;sumY[near]+=gy;cnt[near]++;
+        }
+        pts=pts.map((p,i)=>cnt[i]===0?p:{...p,x:Math.max(aW*.03,Math.min(aW*.97,p.x+(sumX[i]/cnt[i]-p.x)*.6)),y:Math.max(aH*.03,Math.min(aH*.97,p.y+(sumY[i]/cnt[i]-p.y)*.6))});
+      }
+
+      setIterHistory(hist);
+      bestIterRef.current=bestIdx;
+      setIterIdx(bestIdx);
+
+      const best=hist[bestIdx]||hist[hist.length-1];
+      const{edges:ed,cells:cl,minDist,avgD}=best||{edges:[],cells:[],minDist:0,avgD:0};
+      const covPct=best?.coverage??0,conn=best?.connected??false;
       const pl=env==="Indoor"?plIndoor(avgD,ple,wallAtt):plFSPL(avgD);
-      const{tsd,battLife,firstDeath}=simBatt(pts,sensorPower,bV);
-      setNodes(pts);setEdges(ed);setCells(cl);
-      setMet({n:pts.length,minDist,avgD,covPct,pl,conn,W:aW,H:aH,sR:sensorRange,battLife,firstDeath});
+      const{tsd,battLife,firstDeath}=simBatt(best?.pts||[],sensorPower,bV);
+      setNodes(best?.pts||[]);setEdges(ed);setCells(cl);
+      setMet({n:(best?.pts||[]).length,minDist,avgD,covPct,pl,conn,W:aW,H:aH,sR:sensorRange,battLife,firstDeath});
       setTs(tsd);setDone(true);setLoading(false);
     },0);
-  },[numNodes,aW,aH,sensorRange,sensorPower,battType,env,ple,wallAtt,lloydOpt,buildGraph,calcCov,calcConn,simBatt]);
+  },[numNodes,aW,aH,sensorRange,sensorPower,battType,env,ple,wallAtt,buildGraph,calcCov,calcConn,simBatt]);
 
   // ── Main canvas draw ──
   const redraw=useCallback(()=>{
@@ -593,6 +672,29 @@ export default function App() {
                     <div style={{fontSize:10,color:C.muted,fontFamily:"monospace",padding:"4px 10px",borderRadius:6,background:C.card,border:"1px solid "+C.border}}>
                       Drag = move · Right-click = kill/revive · Shows Voronoi territories + Delaunay mesh
                     </div>
+                    {iterHistory.length>1&&(
+                      <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                        <div style={{fontSize:9,color:C.muted,textTransform:"uppercase",letterSpacing:1.6,fontWeight:700}}>Iterations</div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={Math.max(0,iterHistory.length-1)}
+                          step={1}
+                          value={iterIdx}
+                          onChange={e=>{stopPlay();goToIter(+e.target.value);}}
+                          style={{flex:1,accentColor:C.accent,cursor:"pointer",minWidth:220}}
+                        />
+                        <div style={{fontFamily:"monospace",fontSize:11,color:C.accent,minWidth:120,textAlign:"right"}}>
+                          {iterIdx+1}/{iterHistory.length} {iterIdx===bestIterRef.current?"(best)":""}
+                        </div>
+                        <button
+                          onClick={()=>{iterPlaying?stopPlay():playIters();}}
+                          style={{padding:"6px 10px",borderRadius:7,border:"1px solid "+C.border,background:"transparent",color:iterPlaying?C.red:C.teal,cursor:"pointer",fontSize:11,fontWeight:800,fontFamily:"monospace"}}
+                        >
+                          {iterPlaying?"Stop":"Play"}
+                        </button>
+                      </div>
+                    )}
                     <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,overflow:"hidden"}}>
                       <canvas ref={canvasRef} style={{display:"block",width:"100%",cursor:"crosshair"}} onMouseDown={mDown} onMouseMove={mMove} onMouseUp={mUp} onMouseLeave={mUp} onContextMenu={mCtx}/>
                     </div>
@@ -621,6 +723,29 @@ export default function App() {
                 {/* ── COVERAGE ── */}
                 {tab==="coverage"&&(
                   <div style={{display:"flex",flexDirection:"column",gap:12}}>
+                    {iterHistory.length>1&&(
+                      <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,padding:"10px 12px",display:"flex",alignItems:"center",gap:10,flexWrap:"wrap"}}>
+                        <div style={{fontSize:9,color:C.muted,textTransform:"uppercase",letterSpacing:1.6,fontWeight:700}}>Iterations</div>
+                        <input
+                          type="range"
+                          min={0}
+                          max={Math.max(0,iterHistory.length-1)}
+                          step={1}
+                          value={iterIdx}
+                          onChange={e=>{stopPlay();goToIter(+e.target.value);}}
+                          style={{flex:1,accentColor:C.accent,cursor:"pointer",minWidth:220}}
+                        />
+                        <div style={{fontFamily:"monospace",fontSize:11,color:C.accent,minWidth:120,textAlign:"right"}}>
+                          {iterIdx+1}/{iterHistory.length} {iterIdx===bestIterRef.current?"(best)":""}
+                        </div>
+                        <button
+                          onClick={()=>{iterPlaying?stopPlay():playIters();}}
+                          style={{padding:"6px 10px",borderRadius:7,border:"1px solid "+C.border,background:"transparent",color:iterPlaying?C.red:C.teal,cursor:"pointer",fontSize:11,fontWeight:800,fontFamily:"monospace"}}
+                        >
+                          {iterPlaying?"Stop":"Play"}
+                        </button>
+                      </div>
+                    )}
                     <div style={{background:C.card,border:"1px solid "+C.border,borderRadius:10,overflow:"hidden"}}>
                       <canvas ref={canvasRef} style={{display:"block",width:"100%",cursor:"crosshair"}} onMouseDown={mDown} onMouseMove={mMove} onMouseUp={mUp} onMouseLeave={mUp} onContextMenu={mCtx}/>
                     </div>
